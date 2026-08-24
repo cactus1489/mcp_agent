@@ -4,7 +4,7 @@ import json
 from collections.abc import AsyncIterator
 from typing import Any
 
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, Request
 from openai import AsyncOpenAI
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -24,7 +24,7 @@ mcp_client = MCPClient(settings.mcp_server_url, settings.mcp_auth_token)
 mcp_tool_list: list[dict[str, Any]] = []
 
 # 서버가 시작될 때 MCP 서버에서 도구 목록을 한 번 조회해서 전역 변수 mcp_tool_list에 저장하는 초기화 함수
-# yield 이후부터 서버가 /worker 요청 처리
+# yield 이후부터 서버가 /execute 요청 처리
 async def lifespan(_: FastAPI) -> AsyncIterator[None]:
     global mcp_tool_list
     mcp_tool_list = await mcp_client.list_tools()
@@ -32,23 +32,10 @@ async def lifespan(_: FastAPI) -> AsyncIterator[None]:
 
 app = FastAPI(title="MCP Agent", version="0.1.0", lifespan=lifespan)
 
-#powershell에서 한글깨짐 방지
-@app.middleware("http")
-async def add_utf8_charset(request, call_next):
-    response = await call_next(request)
-    content_type = response.headers.get("content-type", "")
-
-    if content_type.startswith("application/json") and "charset=" not in content_type.lower():
-        response.headers["content-type"] = f"{content_type}; charset=utf-8"
-
-    return response
-
-# tools/list 결과와 Worker 요청을 LLM에 주어 하나의 도구를 선택한다.
+# tools/list 결과와 execute 요청을 LLM에 주어 하나의 도구를 선택한다.
 async def select_tool(
     request: str, tool_list: list[dict[str, Any]]
 ) -> tuple[str, dict[str, Any]]:
-    if not tool_list:
-        raise HTTPException(status_code=502, detail="MCP server returned no tools")
 
     client = AsyncOpenAI(
         api_key="ollama",
@@ -58,7 +45,7 @@ async def select_tool(
         model=settings.openai_model,
         input=request,
         instructions=(
-            "Select exactly one function that can fulfill the worker request. "
+            "Select exactly one function that can fulfill the execute request. "
             "Supply only arguments accepted by its JSON schema."
         ),
         tools=tool_list,
@@ -73,22 +60,18 @@ async def select_tool(
 
 @app.post("/execute")
 async def handle_execute_request(request: Request) -> dict[str, Any]:
-    """Receive a Worker instruction and return the selected MCP tool result."""
-    try:
-        worker_request = (await request.json())["request"]
+    """Receive a execute instruction and return the selected MCP tool result."""
+    execute_request = (await request.json())["request"]
 
-        # １) LLM이 요청에 맞는 도구와 JSON 인자를 선택한다.
-        tool_name, arguments = await select_tool(worker_request, mcp_tool_list)
+    # １) LLM이 요청에 맞는 도구와 JSON 인자를 선택한다.
+    tool_name, arguments = await select_tool(execute_request, mcp_tool_list)
 
-        # ２) 선택된 MCP 도구를 실행하고 Worker에 결과를 반환한다.
-        result = await mcp_client.call_tool(tool_name, arguments)
-        worker_response = {
-            "tool_name": tool_name,
-            "arguments": arguments,
-            "tool_result": result,
-        }
-        return worker_response
-    except HTTPException:
-        raise
-    except Exception as error:
-        raise HTTPException(status_code=502, detail=f"MCP operation failed: {error}") from error
+    # ２) 선택된 MCP 도구를 실행하고 execute에 결과를 반환한다.
+    result = await mcp_client.call_tool(tool_name, arguments)
+
+    execute_response = {
+        "tool_name": tool_name,
+        "arguments": arguments,
+        "tool_result": result,
+    }
+    return execute_response
