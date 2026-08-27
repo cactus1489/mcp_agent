@@ -51,7 +51,6 @@ class _MCPSessionContext:
         }
 
     async def __aenter__(self) -> ClientSession:
-            # MCP 권장 timeout을 사용한다: connect/write/pool 30초, SSE read 300초.
             client = create_mcp_http_client(
                 headers={"Authorization": self.auth_token},
             )

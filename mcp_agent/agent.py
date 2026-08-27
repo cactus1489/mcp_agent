@@ -1,7 +1,6 @@
 """FastAPI orchestration endpoint: request -> choose MCP tool -> execute it."""
 
 import json
-import logging
 from collections.abc import AsyncIterator
 from typing import Any, Literal
 
@@ -10,23 +9,11 @@ from openai import AsyncOpenAI
 from pydantic import BaseModel, Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from .logging_config import get_logger, setup_logging
 from .mcp_client import MCPClient
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(name)s - %(message)s",
-)
-
-logger = logging.getLogger(__name__)
-logger.setLevel(logging.INFO)
-if not logger.handlers:
-    console_handler = logging.StreamHandler()
-    console_handler.setLevel(logging.INFO)
-    console_handler.setFormatter(
-        logging.Formatter("%(asctime)s %(levelname)s %(name)s - %(message)s")
-    )
-    logger.addHandler(console_handler)
-logger.propagate = False
+setup_logging()
+logger = get_logger(__name__)
 
 # 실행 디렉터리의 .env 값을 애플리케이션 설정으로 읽는다.
 class Settings(BaseSettings):
@@ -64,10 +51,7 @@ async def select_tool(
 ) -> AgentDecision:
 
     logger.info("LLM input request: %s", request)
-    logger.info(
-        "LLM input tools: %s",
-        json.dumps(tool_list, ensure_ascii=False),
-    )
+    logger.info("LLM input tools: %s", json.dumps(tool_list, ensure_ascii=False),)
 
     client = AsyncOpenAI(
         api_key="ollama",
@@ -125,17 +109,17 @@ async def handle_execute_request(request: Request) -> dict[str, Any]:
     """Receive a execute instruction and return the selected MCP tool result."""
     execute_request = (await request.json())["request"]
 
-    # １) LLM이 요청에 맞는 도구와 JSON 인자를 선택한다.
+    # １) LLM이 요청에 맞는 도구와 JSON 인자 선택
     decision = await select_tool(execute_request, mcp_tool_list)
     logger.info("MCP execution candidate: %s", decision.model_dump())
 
-    # LLM이 결정한 status가 ready일 때만 MCP 도구를 실행한다.
+    # LLM이 결정한 status가 ready일 때만 MCP 도구 실행
     if decision.status != "ready":
         return decision.model_dump(exclude_none=False)
 
-    # ２) 선택된 MCP 도구를 실행하고 execute에 결과를 반환한다.
+    # ２) 선택된 MCP 도구 실행, execute에 결과 반환
     result = await mcp_client.call_tool(decision.tool_name, decision.arguments)
-
+    
     execute_response = {
         "status": decision.status,
         "tool_name": decision.tool_name,
