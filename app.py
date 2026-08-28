@@ -15,7 +15,7 @@ load_dotenv(Path(__file__).with_name(".env"))
 model = OpenAIChatModel(
     os.environ["LLM_MODEL"],
     provider=OpenAIProvider(
-        base_url=os.environ["LLM_BASE_URL"],
+        base_url=os.environ["LLM_BASE_URL"], 
     ),
 )
 
