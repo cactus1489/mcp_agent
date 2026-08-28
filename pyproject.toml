@@ -1,0 +1,16 @@
+[project]
+name = "pydentic-ai"
+version = "0.1.0"
+description = "FastAPI server backed by a PydanticAI MCP agent"
+requires-python = ">=3.11"
+dependencies = [
+    "fastapi",
+    "httpx",
+    "pydantic-ai",
+    "python-dotenv",
+    "uvicorn[standard]",
+]
+
+[tool.uv]
+package = false
+
