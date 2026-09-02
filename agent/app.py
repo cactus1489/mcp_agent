@@ -1,13 +1,16 @@
 import os
 from pathlib import Path
+
 from dotenv import load_dotenv
 from fastapi import FastAPI
-from pydantic_ai import Agent, ToolOutput
+from pydantic_ai import Agent, ToolOutput, UsageLimits
 from pydantic_ai.mcp import MCPToolset
 from pydantic_ai.models.openai import OpenAIChatModel
 from pydantic_ai.providers.openai import OpenAIProvider
 
-from models import AgentOutput, ChatRequest
+from .models import AgentOutput, ChatRequest
+from .logging_utils import logger, log_mcp_execution
+from contextlib import asynccontextmanager
 
 load_dotenv(Path(__file__).parent.parent / ".env")
 
@@ -27,33 +30,51 @@ agent = Agent(
       output_type=ToolOutput(
           AgentOutput,
           name="return_agent_output",
-          description="에이전트의 최종 실행 상태를 구조화하여 반환한다.",
+          description="최종 결과 반환용 도구다. "
+          "반드시 이 도구를 호출해 응답하며 일반 텍스트로 답하지 않는다."
       ),
-      model_settings={"temperature": 0}, #0: 가장 일관적이고 예측 가능한 응답
-      retries={"output": 3},
-        instructions="""
-            사용자 요청과 각 MCP 도구의 설명을 비교하여 적절한 도구를 선택한다.
-
-            도구 인자는 사용자 입력이나 이전 도구 결과에서 확인된 값만 사용한다.
-            특히 코드, ID, 일련번호는 절대 추측하거나 생성하지 않는다.
-
-            선택한 도구의 required 인자가 부족하면 도구를 호출하지 않고
-            status="missing_parameter"로 반환하며, 누락된 property key를
-            MCP input schema에 정의된 이름 그대로 넣는다.
-
-            적절한 도구가 없으면 status="not_found_tool",
-            도구 실행에 성공하면 status="ready"로 반환한다.
-
-            tool_name과 arguments에는 실제 호출한 도구명과 인자를 넣고,
-            tool_result에는 도구가 반환한 JSON 객체 배열을 그대로 넣는다.
-
-            반드시 return_agent_output을 호출하며 일반 텍스트는 출력하지 않는다.
-            tool_result는 자연어 문자열이 아니라 MCP 결과의 각 컬럼을 key로 갖는 JSON 객체 배열로 반환하며, result 필드에 자연어나 Markdown을 넣지 않는다.
-  """
+      retries={"output": 3},#실패를 감지하고 정해진 횟수만큼 재시도하도록 관리(하네스)
+      model_settings={"temperature": 0},
+      #입력값 누락 여부 판단 및 추가 질문 유도
+      instructions=
+        """
+            사용자 요청과 MCP 도구 설명을 비교하여 가장 적절한 도구를 선택한다.
+            관련 도구가 없으면 status="not_found_tool"로 반환한다.
+            관련 도구는 있지만 호출에 필요한 인자가 부족하면 도구를 호출하지 않고 status="missing_parameter"로 반환한다.
+            missing_parameter에는 사용자가 추가로 제공해야 하는 input schema의 property key만 그대로 넣는다.
+            사용자 입력이나 이전 도구 결과에 없는 인자 값은 추측, 생성 또는 임의 변환하지 않는다.
+            검색 결과가 비어 있어도 조건을 변경하여 같은 도구를 다시 호출하지 않는다.
+            도구 호출에 성공하면 status="ready"로 반환한다.
+            tool_name에는 선택하거나 호출한 MCP 도구명을 넣는다.
+            tool_result에는 MCP가 반환한 데이터를 가공하지 않고 JSON 객체 배열로 넣는다. 자연어 또는 Markdown으로 변환하지 않는다.
+            answer에는 사용자의 요청에 대한 최종 답변을 자연스러운 한국어로 작성한다.
+            answer를 작성할 때 tool_result의 내용을 이해하기 쉽게 요약하고 설명한다.
+        """
     )
 app = FastAPI()
 
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    tools = await mcp_toolset.list_tools()
+
+    logger.info("MCP tool count=%d", len(tools))
+
+    for tool in tools:
+        logger.info(
+            "MCP tool name=%s, description=%s",
+            tool.name,
+            tool.description,
+        )
+
+    yield
+
 @app.post("/chat", response_model=AgentOutput)
 async def chat(request: ChatRequest) -> AgentOutput:
-    result = await agent.run(request.request)
+    result = await agent.run(request.request)#사용자 요청과 MCP 도구 설명을 비교해 의도를 판단
+    messages = result.all_messages()
+    logger.info("Agent 실행 완료, message count=%d",len(messages),)
+    log_mcp_execution(messages)
+    tools = await mcp_toolset.list_tools()
+    logger.info("MCP tools count=%d, names=%s", len(tools), [tool.name for tool in tools],)
     return result.output
+
