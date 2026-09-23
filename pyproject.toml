@@ -6,6 +6,7 @@ requires-python = ">=3.11"
 dependencies = [
     "fastapi",
     "httpx",
+    "jsonschema",
     "pydantic-ai",
     "python-dotenv",
     "uvicorn[standard]",
@@ -13,4 +14,3 @@ dependencies = [
 
 [tool.uv]
 package = false
-
