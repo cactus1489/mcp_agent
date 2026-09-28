@@ -5,7 +5,7 @@ import sys
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import Mock, call, patch
+from unittest.mock import ANY, Mock, call, patch
 
 
 sys.path.append(str(Path(__file__).resolve().parents[1] / ".venv" / "Lib" / "site-packages"))
@@ -72,7 +72,8 @@ class SequenceToolCall:
 
 class MCPHarnessConfigurationTests(unittest.TestCase):
     def tearDown(self):
-        register_mcp_output_schemas([])
+        for server_id in ("test", "agriculture", "law"):
+            register_mcp_output_schemas(server_id, [])
 
     def test_agent_usage_limits_are_defined_in_harness(self):
         self.assertEqual(AGENT_USAGE_LIMITS.request_limit, 15)
@@ -168,7 +169,7 @@ class MCPHarnessConfigurationTests(unittest.TestCase):
                     tool_error_behavior="retry",
                     init_timeout=10,
                     read_timeout=30,
-                    process_tool_call=process_mcp_tool_call,
+                    process_tool_call=ANY,
                 ),
                 call(
                     "https://law.test/mcp",
@@ -178,18 +179,28 @@ class MCPHarnessConfigurationTests(unittest.TestCase):
                     tool_error_behavior="retry",
                     init_timeout=10,
                     read_timeout=30,
-                    process_tool_call=process_mcp_tool_call,
+                    process_tool_call=ANY,
                 ),
             ]
         )
+        for actual_call, server_id in zip(
+            toolset_class.call_args_list,
+            ("agriculture", "law"),
+            strict=True,
+        ):
+            callback = actual_call.kwargs["process_tool_call"]
+            self.assertIs(callback.func, process_mcp_tool_call)
+            self.assertEqual(callback.args, (server_id,))
 
     def test_rejects_tool_result_missing_schema_required_field(self):
         register_mcp_output_schemas(
+            "test",
             [SimpleNamespace(name="sample", outputSchema=TOOL_OUTPUT_SCHEMA)]
         )
 
         with self.assertRaises(MCPResultValidationError):
             validate_mcp_result(
+                "test",
                 "sample",
                 {
                     "status": "success",
@@ -201,11 +212,13 @@ class MCPHarnessConfigurationTests(unittest.TestCase):
 
     def test_rejects_source_type_that_conflicts_with_tool_schema(self):
         register_mcp_output_schemas(
+            "test",
             [SimpleNamespace(name="sample", outputSchema=TOOL_OUTPUT_SCHEMA)]
         )
 
         with self.assertRaises(MCPResultValidationError):
             validate_mcp_result(
+                "test",
                 "sample",
                 {
                     "status": "success",
@@ -217,11 +230,13 @@ class MCPHarnessConfigurationTests(unittest.TestCase):
 
     def test_rejects_non_success_code_even_when_schema_allows_string(self):
         register_mcp_output_schemas(
+            "test",
             [SimpleNamespace(name="sample", outputSchema=TOOL_OUTPUT_SCHEMA)]
         )
 
         with self.assertRaises(MCPResultValidationError):
             validate_mcp_result(
+                "test",
                 "sample",
                 {
                     "status": "success",
@@ -233,6 +248,7 @@ class MCPHarnessConfigurationTests(unittest.TestCase):
 
     def test_accepts_result_matching_tool_output_schema(self):
         register_mcp_output_schemas(
+            "test",
             [SimpleNamespace(name="sample", outputSchema=TOOL_OUTPUT_SCHEMA)]
         )
         expected = {
@@ -242,14 +258,15 @@ class MCPHarnessConfigurationTests(unittest.TestCase):
             "data": {"result_type": "candidates", "items": []},
         }
 
-        result = validate_mcp_result("sample", expected)
+        result = validate_mcp_result("test", "sample", expected)
 
         self.assertIs(result, expected)
 
     def test_without_output_schema_skips_data_and_source_structure_validation(self):
-        register_mcp_output_schemas([])
+        register_mcp_output_schemas("test", [])
 
         result = validate_mcp_result(
+            "test",
             "sample",
             {
                 "status": "success",
@@ -259,6 +276,78 @@ class MCPHarnessConfigurationTests(unittest.TestCase):
         )
 
         self.assertEqual(result["source"], [])
+
+    def test_isolates_same_tool_name_schemas_by_server(self):
+        agriculture_schema = {
+            "type": "object",
+            "required": ["data"],
+            "properties": {
+                "data": {
+                    "type": "object",
+                    "required": ["crops"],
+                    "properties": {"crops": {"type": "array"}},
+                }
+            },
+        }
+        law_schema = {
+            "type": "object",
+            "required": ["data"],
+            "properties": {
+                "data": {
+                    "type": "object",
+                    "required": ["statutes"],
+                    "properties": {"statutes": {"type": "array"}},
+                }
+            },
+        }
+        register_mcp_output_schemas(
+            "agriculture",
+            [SimpleNamespace(name="search", outputSchema=agriculture_schema)],
+        )
+        register_mcp_output_schemas(
+            "law",
+            [SimpleNamespace(name="search", outputSchema=law_schema)],
+        )
+        agriculture_result = {
+            "status": "success",
+            "code": "200",
+            "data": {"crops": []},
+        }
+        law_result = {
+            "status": "success",
+            "code": "200",
+            "data": {"statutes": []},
+        }
+
+        self.assertIs(
+            validate_mcp_result("agriculture", "search", agriculture_result),
+            agriculture_result,
+        )
+        self.assertIs(validate_mcp_result("law", "search", law_result), law_result)
+        with self.assertRaises(MCPResultValidationError):
+            validate_mcp_result("agriculture", "search", law_result)
+        with self.assertRaises(MCPResultValidationError):
+            validate_mcp_result("law", "search", agriculture_result)
+
+    def test_reregistering_one_server_preserves_other_server_schemas(self):
+        register_mcp_output_schemas(
+            "agriculture",
+            [SimpleNamespace(name="search", outputSchema={"required": ["agri"]})],
+        )
+        register_mcp_output_schemas(
+            "law",
+            [SimpleNamespace(name="search", outputSchema={"required": ["law"]})],
+        )
+        register_mcp_output_schemas("agriculture", [])
+
+        law_result = {"status": "success", "code": "200", "law": True}
+        self.assertIs(validate_mcp_result("law", "search", law_result), law_result)
+        with self.assertRaises(MCPResultValidationError):
+            validate_mcp_result(
+                "law",
+                "search",
+                {"status": "success", "code": "200", "agri": True},
+            )
 
 
 class ProcessMCPToolCallTests(unittest.IsolatedAsyncioTestCase):
@@ -277,7 +366,7 @@ class ProcessMCPToolCallTests(unittest.IsolatedAsyncioTestCase):
         call_tool = SequenceToolCall([TimeoutError("temporary")])
 
         with self.assertRaises(TimeoutError):
-            await process_mcp_tool_call(TEST_CONTEXT, call_tool, "sample", {})
+            await process_mcp_tool_call("test", TEST_CONTEXT, call_tool, "sample", {})
 
         self.assertEqual(call_tool.call_count, 1)
 
@@ -289,6 +378,7 @@ class ProcessMCPToolCallTests(unittest.IsolatedAsyncioTestCase):
         call_tool = SequenceToolCall([result_with_string_source])
 
         result = await process_mcp_tool_call(
+            "test",
             TEST_CONTEXT,
             call_tool,
             "sample",
@@ -310,7 +400,7 @@ class ProcessMCPToolCallTests(unittest.IsolatedAsyncioTestCase):
         )
 
         with self.assertRaises(MCPToolResultError):
-            await process_mcp_tool_call(TEST_CONTEXT, call_tool, "sample", {})
+            await process_mcp_tool_call("test", TEST_CONTEXT, call_tool, "sample", {})
 
         self.assertEqual(call_tool.call_count, 1)
 
@@ -328,13 +418,14 @@ class ProcessMCPToolCallTests(unittest.IsolatedAsyncioTestCase):
         )
 
         with self.assertRaises(MCPToolResultError):
-            await process_mcp_tool_call(TEST_CONTEXT, call_tool, "sample", {})
+            await process_mcp_tool_call("test", TEST_CONTEXT, call_tool, "sample", {})
 
         self.assertEqual(call_tool.call_count, 1)
 
     async def test_does_not_retry_output_validation_error(self):
-        self.addCleanup(register_mcp_output_schemas, [])
+        self.addCleanup(register_mcp_output_schemas, "test", [])
         register_mcp_output_schemas(
+            "test",
             [
                 SimpleNamespace(
                     name="sample",
@@ -353,7 +444,7 @@ class ProcessMCPToolCallTests(unittest.IsolatedAsyncioTestCase):
         )
 
         with self.assertRaises(MCPResultValidationError):
-            await process_mcp_tool_call(TEST_CONTEXT, call_tool, "sample", {})
+            await process_mcp_tool_call("test", TEST_CONTEXT, call_tool, "sample", {})
 
         self.assertEqual(call_tool.call_count, 1)
 
@@ -370,7 +461,7 @@ class ProcessMCPToolCallTests(unittest.IsolatedAsyncioTestCase):
         }
 
         with self.assertLogs("uvicorn.error", level="INFO") as captured:
-            await process_mcp_tool_call(TEST_CONTEXT, call_tool, "sample", args)
+            await process_mcp_tool_call("test", TEST_CONTEXT, call_tool, "sample", args)
 
         logs = "\n".join(captured.output)
         self.assertIn("trace-123", logs)
@@ -394,7 +485,7 @@ class ProcessMCPToolCallTests(unittest.IsolatedAsyncioTestCase):
 
         with self.assertLogs("uvicorn.error", level="ERROR") as captured:
             with self.assertRaises(TimeoutError):
-                await process_mcp_tool_call(TEST_CONTEXT, call_tool, "sample", {})
+                await process_mcp_tool_call("test", TEST_CONTEXT, call_tool, "sample", {})
 
         logs = "\n".join(captured.output)
         self.assertIn("MCP TOOL CALL FAILED", logs)

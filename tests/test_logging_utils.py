@@ -9,6 +9,8 @@ from agent.logging_utils import (
     log_agent_decision,
     log_chat_complete,
     log_chat_failure,
+    log_mcp_server_connected,
+    log_mcp_server_connection_failed,
     log_mcp_tool_result,
     log_mcp_tool_start,
 )
@@ -27,10 +29,11 @@ class LoggingUtilsTests(unittest.TestCase):
         }
 
         with self.assertLogs("uvicorn.error", level="INFO") as captured:
-            log_mcp_tool_result("trace-123", "sample", "call-456", result)
+            log_mcp_tool_result("trace-123", "agriculture", "sample", "call-456", result)
 
         logs = "\n".join(captured.output)
         self.assertIn("trace-123", logs)
+        self.assertIn("server=agriculture", logs)
         self.assertIn("tool=sample", logs)
         self.assertIn("call_id=call-456", logs)
         self.assertIn("status=success", logs)
@@ -64,6 +67,7 @@ class LoggingUtilsTests(unittest.TestCase):
         with self.assertLogs("uvicorn.error", level="INFO") as captured:
             log_mcp_tool_start(
                 "trace-123",
+                "agriculture",
                 "sample",
                 "call-456",
                 1,
@@ -71,6 +75,7 @@ class LoggingUtilsTests(unittest.TestCase):
             )
 
         logs = "\n".join(captured.output)
+        self.assertIn("server=agriculture", logs)
         self.assertIn('"api_key": "***"', logs)
         self.assertNotIn("secret", logs)
         self.assertNotIn("private", logs)
@@ -82,6 +87,36 @@ class LoggingUtilsTests(unittest.TestCase):
         logs = "\n".join(captured.output)
         self.assertIn("type=RuntimeError", logs)
         self.assertNotIn("private detail", logs)
+
+    def test_connection_logs_sanitize_url_and_exception(self):
+        url = (
+            "https://user:password@[2001:db8::1]:8101/mcp"
+            "?api_key=secret-query#private-fragment"
+        )
+
+        with self.assertLogs("uvicorn.error", level="INFO") as connected:
+            log_mcp_server_connected("agriculture", url, 5)
+        with self.assertLogs("uvicorn.error", level="ERROR") as failed:
+            log_mcp_server_connection_failed(
+                "agriculture",
+                url,
+                RuntimeError("secret exception detail"),
+            )
+
+        logs = "\n".join(connected.output + failed.output)
+        self.assertIn("id=agriculture", logs)
+        self.assertIn("host=[2001:db8::1]:8101", logs)
+        self.assertIn("tool_count=5", logs)
+        self.assertIn("error_type=RuntimeError", logs)
+        for secret in (
+            "user",
+            "password",
+            "api_key",
+            "secret-query",
+            "private-fragment",
+            "secret exception detail",
+        ):
+            self.assertNotIn(secret, logs)
 
 
 if __name__ == "__main__":

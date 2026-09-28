@@ -5,6 +5,7 @@ from collections.abc import Mapping
 from datetime import datetime
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 logger = logging.getLogger("uvicorn.error")
 _QA_LOG_LOCK = threading.Lock()
@@ -25,6 +26,36 @@ SENSITIVE_KEYS = {
 MASKED_VALUE = "***"
 
 
+def _format_mcp_host(url: str) -> str:
+    parsed = urlsplit(url)
+    hostname = parsed.hostname or "unknown"
+    if ":" in hostname:
+        hostname = f"[{hostname}]"
+    return f"{hostname}:{parsed.port}" if parsed.port is not None else hostname
+
+
+def log_mcp_server_connected(server_id: str, url: str, tool_count: int) -> None:
+    logger.info(
+        "MCP SERVER CONNECTED id=%s host=%s tool_count=%d",
+        server_id,
+        _format_mcp_host(url),
+        tool_count,
+    )
+
+
+def log_mcp_server_connection_failed(
+    server_id: str,
+    url: str,
+    exc: BaseException,
+) -> None:
+    logger.error(
+        "MCP SERVER CONNECTION FAILED id=%s host=%s error_type=%s",
+        server_id,
+        _format_mcp_host(url),
+        type(exc).__name__,
+    )
+
+# 민감정보 마스킹
 def mask_sensitive(value: Any) -> Any:
     """Return a copy with values of sensitive keys masked recursively."""
     if isinstance(value, Mapping):
@@ -42,9 +73,10 @@ def mask_sensitive(value: Any) -> Any:
 
     return value
 
-
+# Tool 호출 시작 로그
 def log_mcp_tool_start(
     execution_trace_id: str,
+    server_id: str,
     tool_name: str,
     tool_call_id: str,
     attempt: int,
@@ -57,17 +89,19 @@ def log_mcp_tool_start(
         default=str,
     )
     logger.info(
-        "[%s] MCP TOOL CALL START tool=%s call_id=%s attempt=%d args=%s",
+        "[%s] MCP TOOL CALL START server=%s tool=%s call_id=%s attempt=%d args=%s",
         execution_trace_id,
+        server_id,
         tool_name,
         tool_call_id,
         attempt,
         masked_args,
     )
 
-
+# Tool 결과 요약 로그
 def log_mcp_tool_result(
     execution_trace_id: str,
+    server_id: str,
     tool_name: str,
     tool_call_id: str,
     result: Mapping[str, Any],
@@ -79,9 +113,10 @@ def log_mcp_tool_result(
     item_count = len(items) if isinstance(items, list) else None
 
     logger.info(
-        "[%s] MCP TOOL RESULT tool=%s call_id=%s status=%s code=%s "
+        "[%s] MCP TOOL RESULT server=%s tool=%s call_id=%s status=%s code=%s "
         "data_type=%s result_type=%s item_count=%s",
         execution_trace_id,
+        server_id,
         tool_name,
         tool_call_id,
         result.get("status"),
@@ -91,26 +126,29 @@ def log_mcp_tool_result(
         item_count,
     )
 
-
+# Tool 완료 로그 
 def log_mcp_tool_complete(
     execution_trace_id: str,
+    server_id: str,
     tool_name: str,
     tool_call_id: str,
     attempt: int,
     duration: float,
 ) -> None:
     logger.info(
-        "[%s] MCP TOOL CALL COMPLETE tool=%s call_id=%s attempt=%d duration=%.3fs",
+        "[%s] MCP TOOL CALL COMPLETE server=%s tool=%s call_id=%s attempt=%d duration=%.3fs",
         execution_trace_id,
+        server_id,
         tool_name,
         tool_call_id,
         attempt,
         duration,
     )
 
-
+# Tool 오류 로그
 def log_mcp_tool_error(
     execution_trace_id: str,
+    server_id: str,
     tool_name: str,
     tool_call_id: str,
     attempt: int,
@@ -121,9 +159,10 @@ def log_mcp_tool_error(
     event = "RETRY" if retrying else "FAILED"
     log = logger.warning if retrying else logger.error
     log(
-        "[%s] MCP TOOL CALL %s tool=%s call_id=%s attempt=%d duration=%.3fs error_type=%s code=%s",
+        "[%s] MCP TOOL CALL %s server=%s tool=%s call_id=%s attempt=%d duration=%.3fs error_type=%s code=%s",
         execution_trace_id,
         event,
+        server_id,
         tool_name,
         tool_call_id,
         attempt,
@@ -131,8 +170,7 @@ def log_mcp_tool_error(
         type(exc).__name__,
         getattr(exc, "code", None),
     )
-
-
+# 최종 Agent 판단 로그
 def log_agent_decision(
     execution_trace_id: str,
     status: str,
@@ -174,7 +212,7 @@ def log_chat_failure(
     )
 
 
-# 사용자 질문과 최종 답변을 날짜별 로그 파일에 한 줄씩 누적 저장
+# 질문·답변 감사 로그 
 def write_qa_audit_log(execution_trace_id: str, question: str, answer: str) -> None:
     """Append only the user's question and final answer to today's log file."""
     log_dir = Path(__file__).resolve().parent.parent / "logs"

@@ -3,6 +3,7 @@ import os
 import time
 from collections.abc import Iterable
 from dataclasses import dataclass
+from functools import partial
 from typing import Any
 from urllib.parse import urlsplit
 
@@ -24,7 +25,7 @@ AGENT_USAGE_LIMITS = UsageLimits(
     tool_calls_limit=10,
     total_tokens_limit=500_000,
 )
-_OUTPUT_VALIDATORS: dict[str, Draft202012Validator] = {}
+_OUTPUT_VALIDATORS: dict[tuple[str, str], Draft202012Validator] = {}
 
 
 @dataclass(frozen=True)
@@ -108,7 +109,7 @@ def create_mcp_server_runtimes(
             tool_error_behavior="retry",
             init_timeout=10,
             read_timeout=30,
-            process_tool_call=process_mcp_tool_call,
+            process_tool_call=partial(process_mcp_tool_call, config.id),
         )
         runtimes.append(
             MCPServerRuntime(
@@ -135,17 +136,22 @@ class MCPToolResultError(RuntimeError):
         )
 
 # Tool별 Output Schema 저장
-def register_mcp_output_schemas(tools: Iterable[Any]) -> None:
+def register_mcp_output_schemas(server_id: str, tools: Iterable[Any]) -> None:
     """MCP Tool 이름별 outputSchema Validator를 등록한다."""
-    _OUTPUT_VALIDATORS.clear()
+    for key in [key for key in _OUTPUT_VALIDATORS if key[0] == server_id]:
+        del _OUTPUT_VALIDATORS[key]
     for tool in tools:
         schema = getattr(tool, "outputSchema", None)
         if schema:
             Draft202012Validator.check_schema(schema)
-            _OUTPUT_VALIDATORS[tool.name] = Draft202012Validator(schema)
+            _OUTPUT_VALIDATORS[(server_id, tool.name)] = Draft202012Validator(schema)
 
 # MCP 공통 결과 검증
-def validate_mcp_result(tool_name: str, result: Any) -> dict[str, Any]:
+def validate_mcp_result(
+    server_id: str,
+    tool_name: str,
+    result: Any,
+) -> dict[str, Any]:
     """MCP Tool 결과의 상태, 코드, 데이터 및 출처 형식을 검증한다."""
     if not isinstance(result, dict):
         raise MCPResultValidationError(
@@ -164,7 +170,7 @@ def validate_mcp_result(tool_name: str, result: Any) -> dict[str, Any]:
             f"MCP tool {tool_name!r} returned an invalid success code: {code!r}"
         )
 # Tool별 Output Validation
-    validator = _OUTPUT_VALIDATORS.get(tool_name)
+    validator = _OUTPUT_VALIDATORS.get((server_id, tool_name))
     if validator is not None:
         try:
             validator.validate(result)
@@ -176,7 +182,13 @@ def validate_mcp_result(tool_name: str, result: Any) -> dict[str, Any]:
 
     return result
 # MCP Tool 호출 하네스
-async def process_mcp_tool_call(ctx, call_tool, tool_name: str, args: dict[str, Any]):
+async def process_mcp_tool_call(
+    server_id: str,
+    ctx,
+    call_tool,
+    tool_name: str,
+    args: dict[str, Any],
+):
     """MCP Tool을 한 번 호출하고 결과 검증 및 실행 Trace를 처리한다."""
     execution_trace_id = ctx.run_id or "unknown"
     tool_call_id = ctx.tool_call_id or "unknown"
@@ -185,6 +197,7 @@ async def process_mcp_tool_call(ctx, call_tool, tool_name: str, args: dict[str, 
 
     log_mcp_tool_start(
         execution_trace_id,
+        server_id,
         tool_name,
         tool_call_id,
         attempt,
@@ -192,9 +205,10 @@ async def process_mcp_tool_call(ctx, call_tool, tool_name: str, args: dict[str, 
     )
     try:
         result = await call_tool(tool_name, args)
-        result = validate_mcp_result(tool_name, result)
+        result = validate_mcp_result(server_id, tool_name, result)
         log_mcp_tool_result(
             execution_trace_id,
+            server_id,
             tool_name,
             tool_call_id,
             result,
@@ -202,6 +216,7 @@ async def process_mcp_tool_call(ctx, call_tool, tool_name: str, args: dict[str, 
     except Exception as exc:
         log_mcp_tool_error(
             execution_trace_id,
+            server_id,
             tool_name,
             tool_call_id,
             attempt,
@@ -213,6 +228,7 @@ async def process_mcp_tool_call(ctx, call_tool, tool_name: str, args: dict[str, 
 
     log_mcp_tool_complete(
         execution_trace_id,
+        server_id,
         tool_name,
         tool_call_id,
         attempt,
@@ -230,5 +246,5 @@ def create_mcp_toolset() -> MCPToolset:
         tool_error_behavior="retry",
         init_timeout=10,
         read_timeout=30,
-        process_tool_call=process_mcp_tool_call,
+        process_tool_call=partial(process_mcp_tool_call, "default"),
     )
