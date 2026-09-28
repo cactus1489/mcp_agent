@@ -271,16 +271,3 @@ async def process_mcp_tool_call(
         time.perf_counter() - started_at,
     )
     return result
-
-
-def create_mcp_toolset() -> MCPToolset:
-    """연결 정보와 실행 정책이 적용된 MCP Toolset을 생성한다."""
-    return MCPToolset(
-        os.environ["MCP_SERVER_URL"],
-        headers={"Authorization": os.environ["MCP_API_KEY"]},
-        max_retries=1,
-        tool_error_behavior="retry",
-        init_timeout=10,
-        read_timeout=30,
-        process_tool_call=partial(process_mcp_tool_call, "default"),
-    )

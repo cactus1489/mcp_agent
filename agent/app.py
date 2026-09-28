@@ -1,12 +1,14 @@
 import os
 import secrets
 import time
+from collections.abc import Sequence
 from contextlib import asynccontextmanager
 from pathlib import Path
+from typing import Any
 from uuid import uuid4
 
 from dotenv import load_dotenv
-from fastapi import Depends, FastAPI, HTTPException, status
+from fastapi import Depends, FastAPI, HTTPException, Request, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic_ai import Agent, ToolOutput
 from pydantic_ai.models.openai import OpenAIChatModel
@@ -15,8 +17,9 @@ from pydantic_ai.providers.openai import OpenAIProvider
 from .models import AgentLLMOutput, AgentOutput, ChatRequest
 from .mcp_harness import (
     AGENT_USAGE_LIMITS,
-    create_mcp_toolset,
-    register_mcp_output_schemas,
+    create_mcp_server_runtimes,
+    discover_mcp_servers,
+    load_mcp_server_configs,
 )
 from .mcp_result_utils import get_mcp_results
 from .logging_utils import (
@@ -33,6 +36,7 @@ load_dotenv(Path(__file__).parent.parent / ".env")
 AGENT_API_KEY = os.environ["AGENT_API_KEY"]
 agent_bearer = HTTPBearer(auto_error=False)
 
+#key값 받아서 검사
 def verify_agent_api_key(
     credentials: HTTPAuthorizationCredentials | None = Depends(agent_bearer),
 ) -> None:
@@ -53,18 +57,19 @@ model = OpenAIChatModel(
     provider=OpenAIProvider(base_url=os.environ["LLM_BASE_URL"]),
 )
 
-mcp_toolset = create_mcp_toolset()
-
-agent = Agent(
+# LLM 모델, MCP Toolset, 구조화 출력 연결
+def create_agent(toolsets: Sequence[Any]) -> Agent:
+    return Agent(
       model,
-      toolsets=[mcp_toolset],
+      toolsets=list(toolsets),
+    #   구조화된 최종 출력
       output_type=ToolOutput(
           AgentLLMOutput,
           name="return_agent_output",
           description="최종 결과 반환용 도구다. 반드시 이 도구를 호출해 응답하며 일반 텍스트로 답하지 않는다."),
-      retries={"output": 3},#잘못된 출력을 감지하고 정해진 횟수만큼 재시도하도록 관리(하네스)
+      retries={"output": 3},
       model_settings={"temperature": 0},
-      #입력값 누락 여부 판단 및 추가 질문 유도
+    #   Tool 선택·상태 판단 정책
       instructions=
         """
             사용자 요청과 MCP 도구의 목적, 입력 조건, 출력 정보를 비교하여 가장 적절한 도구를 선택한다.
@@ -90,29 +95,38 @@ agent = Agent(
         """
     )
 
-#서버 시작 전 툴 목록 가져오기
+# 서버 시작 시 Tool Schema 등록
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    tools = await mcp_toolset.list_tools()
-    register_mcp_output_schemas(tools)
-    yield
+    configs = load_mcp_server_configs()
+    runtimes = create_mcp_server_runtimes(configs, os.environ["MCP_API_KEY"])
+    healthy_runtimes = await discover_mcp_servers(runtimes)
+    app.state.agent = create_agent(
+        [runtime.prefixed_toolset for runtime in healthy_runtimes]
+    )
+    try:
+        yield
+    finally:
+        del app.state.agent
 
 app = FastAPI(lifespan=lifespan)
 
-@app.post(
-    "/chat",
-    response_model=AgentOutput,
-    dependencies=[Depends(verify_agent_api_key)],
-)
-async def chat(request: ChatRequest) -> AgentOutput:
+
+def get_agent(request: Request) -> Agent:
+    return request.app.state.agent
+
+@app.post("/chat", response_model=AgentOutput, dependencies=[Depends(verify_agent_api_key)],)
+async def chat(
+    request: ChatRequest,
+    runtime_agent: Agent = Depends(get_agent),
+) -> AgentOutput:
     execution_trace_id = str(uuid4())
     started_at = time.perf_counter()
-    # log_chat_start(execution_trace_id, len(request.request), 180)
-
+# 전체 요청 Timeout
     try:
         async with asyncio.timeout(180):
-            result = await agent.run(request.request, run_id=execution_trace_id, usage_limits=AGENT_USAGE_LIMITS,)
-
+            result = await runtime_agent.run(request.request, run_id=execution_trace_id, usage_limits=AGENT_USAGE_LIMITS,)
+# Tool 결과 응답 연결
         response = AgentOutput(
             execution_trace_id=execution_trace_id,
             status=result.output.status,
@@ -134,12 +148,8 @@ async def chat(request: ChatRequest) -> AgentOutput:
             answer="외부 전문정보 조회 중 오류가 발생했습니다.",
         )
 
-    log_agent_decision(
-        execution_trace_id,
-        response.status,
-        len(response.tool_results),
-        len(response.missing_parameter),
-    )
+# Agent 판단 로그 연결
+    log_agent_decision(execution_trace_id, response.status, len(response.tool_results),len(response.missing_parameter),)
     write_qa_audit_log(execution_trace_id, request.request, response.answer)
     log_chat_complete(execution_trace_id, time.perf_counter() - started_at)
     return response

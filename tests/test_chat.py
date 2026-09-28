@@ -1,5 +1,6 @@
 import sys
 import logging
+import os
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -34,31 +35,74 @@ class ChatTests(unittest.IsolatedAsyncioTestCase):
             all_messages=Mock(side_effect=RuntimeError("processing failed")),
         )
 
-        with (
-            patch.object(app_module.agent, "run", AsyncMock(return_value=result)),
-            patch.object(app_module, "write_qa_audit_log"),
-        ):
+        runtime_agent = SimpleNamespace(run=AsyncMock(return_value=result))
+        with patch.object(app_module, "write_qa_audit_log"):
             response = None
             caught = None
             try:
-                response = await app_module.chat(ChatRequest(request="test"))
+                response = await app_module.chat(
+                    ChatRequest(request="test"),
+                    runtime_agent=runtime_agent,
+                )
             except Exception as exc:
                 caught = exc
 
         self.assertIsNone(caught)
         self.assertEqual(response.status, "FAILED")
 
-    async def test_lifespan_registers_mcp_output_schemas(self):
-        tools = [SimpleNamespace(name="sample", outputSchema={"type": "object"})]
+    async def test_lifespan_builds_agent_from_only_healthy_prefixed_toolsets(self):
+        configs = [Mock(), Mock()]
+        runtimes = [Mock(), Mock()]
+        healthy = [runtimes[1]]
+        created_agent = Mock()
 
         with (
-            patch.object(app_module.mcp_toolset, "list_tools", AsyncMock(return_value=tools)),
-            patch.object(app_module, "register_mcp_output_schemas") as register,
+            patch.dict(os.environ, {"MCP_API_KEY": "Bearer shared"}, clear=False),
+            patch.object(app_module, "load_mcp_server_configs", return_value=configs),
+            patch.object(app_module, "create_mcp_server_runtimes", return_value=runtimes) as create_runtimes,
+            patch.object(app_module, "discover_mcp_servers", AsyncMock(return_value=healthy)),
+            patch.object(app_module, "create_agent", return_value=created_agent) as create_agent,
         ):
             async with app_module.lifespan(app_module.app):
-                pass
+                self.assertIs(app_module.app.state.agent, created_agent)
 
-        register.assert_called_once_with(tools)
+        create_runtimes.assert_called_once_with(configs, "Bearer shared")
+        create_agent.assert_called_once_with([runtimes[1].prefixed_toolset])
+        self.assertFalse(hasattr(app_module.app.state, "agent"))
+
+    async def test_lifespan_fails_when_discovery_has_no_healthy_server(self):
+        with (
+            patch.dict(os.environ, {"MCP_API_KEY": "Bearer shared"}, clear=False),
+            patch.object(app_module, "load_mcp_server_configs", return_value=[Mock()]),
+            patch.object(app_module, "create_mcp_server_runtimes", return_value=[Mock()]),
+            patch.object(
+                app_module,
+                "discover_mcp_servers",
+                AsyncMock(side_effect=RuntimeError("No MCP servers connected.")),
+            ),
+            patch.object(app_module, "create_agent") as create_agent,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "No MCP servers connected"):
+                async with app_module.lifespan(app_module.app):
+                    pass
+
+        create_agent.assert_not_called()
+
+    def test_get_agent_returns_lifespan_agent(self):
+        expected = Mock()
+        request = SimpleNamespace(
+            app=SimpleNamespace(state=SimpleNamespace(agent=expected))
+        )
+
+        self.assertIs(app_module.get_agent(request), expected)
+
+    def test_create_agent_uses_all_toolsets(self):
+        toolsets = [Mock(), Mock()]
+        with patch.object(app_module, "Agent") as agent_class:
+            result = app_module.create_agent(toolsets)
+
+        self.assertIs(result, agent_class.return_value)
+        self.assertEqual(agent_class.call_args.kwargs["toolsets"], toolsets)
 
     async def test_chat_logs_final_agent_decision(self):
         result = SimpleNamespace(
@@ -70,12 +114,15 @@ class ChatTests(unittest.IsolatedAsyncioTestCase):
             all_messages=Mock(return_value=[]),
         )
 
+        runtime_agent = SimpleNamespace(run=AsyncMock(return_value=result))
         with (
-            patch.object(app_module.agent, "run", AsyncMock(return_value=result)),
             patch.object(app_module, "write_qa_audit_log"),
             self.assertLogs("uvicorn.error", level="INFO") as captured,
         ):
-            await app_module.chat(ChatRequest(request="test"))
+            await app_module.chat(
+                ChatRequest(request="test"),
+                runtime_agent=runtime_agent,
+            )
 
         logs = "\n".join(captured.output)
         self.assertIn(
@@ -84,16 +131,17 @@ class ChatTests(unittest.IsolatedAsyncioTestCase):
         )
 
     async def test_unexpected_error_log_does_not_include_exception_message(self):
+        runtime_agent = SimpleNamespace(
+            run=AsyncMock(side_effect=RuntimeError("private exception detail"))
+        )
         with (
-            patch.object(
-                app_module.agent,
-                "run",
-                AsyncMock(side_effect=RuntimeError("private exception detail")),
-            ),
             patch.object(app_module, "write_qa_audit_log"),
             self.assertLogs("uvicorn.error", level="INFO") as captured,
         ):
-            response = await app_module.chat(ChatRequest(request="test"))
+            response = await app_module.chat(
+                ChatRequest(request="test"),
+                runtime_agent=runtime_agent,
+            )
 
         logs = "\n".join(captured.output)
         self.assertEqual(response.status, "FAILED")
