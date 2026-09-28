@@ -1,19 +1,23 @@
+import json
 import logging
 import os
 import sys
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, call, patch
 
 
 sys.path.append(str(Path(__file__).resolve().parents[1] / ".venv" / "Lib" / "site-packages"))
 
 from agent.mcp_harness import (
     AGENT_USAGE_LIMITS,
+    MCPServerConfig,
     MCPResultValidationError,
     MCPToolResultError,
-    create_mcp_toolset,
+    create_mcp_server_runtimes,
+    load_mcp_server_configs,
+    parse_mcp_server_configs,
     process_mcp_tool_call,
     register_mcp_output_schemas,
     validate_mcp_result,
@@ -75,26 +79,108 @@ class MCPHarnessConfigurationTests(unittest.TestCase):
         self.assertEqual(AGENT_USAGE_LIMITS.tool_calls_limit, 10)
         self.assertEqual(AGENT_USAGE_LIMITS.total_tokens_limit, 500_000)
 
-    def test_create_mcp_toolset_uses_harness_connection_policy(self):
-        env = {
-            "MCP_SERVER_URL": "https://mcp.example.test",
-            "MCP_API_KEY": "test-key",
-        }
-        with (
-            patch.dict(os.environ, env, clear=False),
-            patch("agent.mcp_harness.MCPToolset") as toolset_class,
-        ):
-            result = create_mcp_toolset()
+    def test_parses_multi_server_json(self):
+        raw = (
+            '[{"id":"agriculture","url":"https://aic.iteyes.io:8101/mcp",'
+            '"prefix":"agriculture"},{"id":"law",'
+            '"url":"https://mcp.gomdori.app/law?oc=honggildong",'
+            '"prefix":"law"}]'
+        )
 
-        self.assertIs(result, toolset_class.return_value)
-        toolset_class.assert_called_once_with(
-            env["MCP_SERVER_URL"],
-            headers={"Authorization": env["MCP_API_KEY"]},
-            max_retries=1,
-            tool_error_behavior="retry",
-            init_timeout=10,
-            read_timeout=30,
-            process_tool_call=process_mcp_tool_call,
+        self.assertEqual(
+            parse_mcp_server_configs(raw),
+            [
+                MCPServerConfig(
+                    id="agriculture",
+                    url="https://aic.iteyes.io:8101/mcp",
+                    prefix="agriculture",
+                ),
+                MCPServerConfig(
+                    id="law",
+                    url="https://mcp.gomdori.app/law?oc=honggildong",
+                    prefix="law",
+                ),
+            ],
+        )
+
+    def test_rejects_invalid_top_level_or_empty_server_list(self):
+        for raw in ("not-json", "{}", "[]"):
+            with self.subTest(raw=raw), self.assertRaises(ValueError) as caught:
+                parse_mcp_server_configs(raw)
+            self.assertNotIn(raw, str(caught.exception))
+
+    def test_rejects_blank_or_duplicate_id_and_prefix(self):
+        invalid_values = (
+            '[{"id":" ","url":"https://one.test/mcp","prefix":"one"}]',
+            '[{"id":"one","url":"https://one.test/mcp","prefix":" "}]',
+            '[{"id":"same","url":"https://one.test/mcp","prefix":"one"},'
+            '{"id":"same","url":"https://two.test/mcp","prefix":"two"}]',
+            '[{"id":"one","url":"https://one.test/mcp","prefix":"same"},'
+            '{"id":"two","url":"https://two.test/mcp","prefix":"same"}]',
+        )
+        for raw in invalid_values:
+            with self.subTest(raw=raw), self.assertRaises(ValueError):
+                parse_mcp_server_configs(raw)
+
+    def test_rejects_non_http_absolute_urls(self):
+        for url in ("/mcp", "ftp://example.test/mcp", "https:///mcp"):
+            raw = json.dumps([{"id": "one", "url": url, "prefix": "one"}])
+            with self.subTest(url=url), self.assertRaises(ValueError):
+                parse_mcp_server_configs(raw)
+
+    def test_loads_configs_from_mcp_servers_environment(self):
+        raw = '[{"id":"one","url":"https://one.test/mcp","prefix":"one"}]'
+
+        with patch.dict(os.environ, {"MCP_SERVERS": raw}, clear=False):
+            self.assertEqual(
+                load_mcp_server_configs(),
+                [MCPServerConfig("one", "https://one.test/mcp", "one")],
+            )
+
+    def test_creates_prefixed_runtime_for_each_server_with_shared_authorization(self):
+        configs = [
+            MCPServerConfig("agriculture", "https://agri.test/mcp", "agriculture"),
+            MCPServerConfig("law", "https://law.test/mcp", "law"),
+        ]
+        agriculture_toolset = Mock()
+        law_toolset = Mock()
+
+        with patch(
+            "agent.mcp_harness.MCPToolset",
+            side_effect=[agriculture_toolset, law_toolset],
+        ) as toolset_class:
+            runtimes = create_mcp_server_runtimes(configs, "Bearer shared-key")
+
+        self.assertEqual([runtime.config for runtime in runtimes], configs)
+        self.assertIs(runtimes[0].toolset, agriculture_toolset)
+        self.assertIs(runtimes[0].prefixed_toolset, agriculture_toolset.prefixed.return_value)
+        self.assertIs(runtimes[1].toolset, law_toolset)
+        self.assertIs(runtimes[1].prefixed_toolset, law_toolset.prefixed.return_value)
+        agriculture_toolset.prefixed.assert_called_once_with("agriculture")
+        law_toolset.prefixed.assert_called_once_with("law")
+        toolset_class.assert_has_calls(
+            [
+                call(
+                    "https://agri.test/mcp",
+                    id="agriculture",
+                    headers={"Authorization": "Bearer shared-key"},
+                    max_retries=1,
+                    tool_error_behavior="retry",
+                    init_timeout=10,
+                    read_timeout=30,
+                    process_tool_call=process_mcp_tool_call,
+                ),
+                call(
+                    "https://law.test/mcp",
+                    id="law",
+                    headers={"Authorization": "Bearer shared-key"},
+                    max_retries=1,
+                    tool_error_behavior="retry",
+                    init_timeout=10,
+                    read_timeout=30,
+                    process_tool_call=process_mcp_tool_call,
+                ),
+            ]
         )
 
     def test_rejects_tool_result_missing_schema_required_field(self):

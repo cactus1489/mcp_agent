@@ -1,12 +1,16 @@
+import json
 import os
 import time
 from collections.abc import Iterable
+from dataclasses import dataclass
 from typing import Any
+from urllib.parse import urlsplit
 
 from jsonschema import Draft202012Validator
 from jsonschema.exceptions import ValidationError
 from pydantic_ai import UsageLimits
 from pydantic_ai.mcp import MCPToolset
+from pydantic_ai.toolsets import AbstractToolset
 
 from .logging_utils import (
     log_mcp_tool_complete,
@@ -14,13 +18,106 @@ from .logging_utils import (
     log_mcp_tool_result,
     log_mcp_tool_start,
 )
-
+# 사용량 제한
 AGENT_USAGE_LIMITS = UsageLimits(
     request_limit=15,
     tool_calls_limit=10,
     total_tokens_limit=500_000,
 )
 _OUTPUT_VALIDATORS: dict[str, Draft202012Validator] = {}
+
+
+@dataclass(frozen=True)
+class MCPServerConfig:
+    id: str
+    url: str
+    prefix: str
+
+
+@dataclass(frozen=True)
+class MCPServerRuntime:
+    config: MCPServerConfig
+    toolset: MCPToolset
+    prefixed_toolset: AbstractToolset[Any]
+
+
+def parse_mcp_server_configs(raw: str) -> list[MCPServerConfig]:
+    """Parse and validate the configured MCP HTTP servers."""
+    try:
+        values = json.loads(raw)
+    except (TypeError, json.JSONDecodeError) as exc:
+        raise ValueError("MCP_SERVERS must be valid JSON.") from exc
+
+    if not isinstance(values, list) or not values:
+        raise ValueError("MCP_SERVERS must be a non-empty JSON array.")
+
+    configs: list[MCPServerConfig] = []
+    ids: set[str] = set()
+    prefixes: set[str] = set()
+    required_fields = {"id", "url", "prefix"}
+
+    for value in values:
+        if not isinstance(value, dict) or set(value) != required_fields:
+            raise ValueError("Each MCP server must define id, url, and prefix.")
+
+        server_id = value["id"]
+        url = value["url"]
+        prefix = value["prefix"]
+        if not all(isinstance(item, str) and item.strip() for item in (server_id, url, prefix)):
+            raise ValueError("MCP server id, url, and prefix must be non-empty strings.")
+
+        server_id = server_id.strip()
+        url = url.strip()
+        prefix = prefix.strip()
+        parsed_url = urlsplit(url)
+        try:
+            _ = parsed_url.port
+        except ValueError as exc:
+            raise ValueError("MCP server URL contains an invalid port.") from exc
+        if parsed_url.scheme not in {"http", "https"} or not parsed_url.hostname:
+            raise ValueError("MCP server URL must be an absolute HTTP(S) URL.")
+
+        if server_id in ids:
+            raise ValueError("MCP server IDs must be unique.")
+        if prefix in prefixes:
+            raise ValueError("MCP server prefixes must be unique.")
+        ids.add(server_id)
+        prefixes.add(prefix)
+        configs.append(MCPServerConfig(server_id, url, prefix))
+
+    return configs
+
+
+def load_mcp_server_configs() -> list[MCPServerConfig]:
+    """Load MCP server definitions from the environment."""
+    return parse_mcp_server_configs(os.environ["MCP_SERVERS"])
+
+
+def create_mcp_server_runtimes(
+    configs: Iterable[MCPServerConfig],
+    api_key: str,
+) -> list[MCPServerRuntime]:
+    """Create one raw and prefixed MCP toolset for each server."""
+    runtimes: list[MCPServerRuntime] = []
+    for config in configs:
+        toolset = MCPToolset(
+            config.url,
+            id=config.id,
+            headers={"Authorization": api_key},
+            max_retries=1,
+            tool_error_behavior="retry",
+            init_timeout=10,
+            read_timeout=30,
+            process_tool_call=process_mcp_tool_call,
+        )
+        runtimes.append(
+            MCPServerRuntime(
+                config=config,
+                toolset=toolset,
+                prefixed_toolset=toolset.prefixed(config.prefix),
+            )
+        )
+    return runtimes
 
 
 class MCPResultValidationError(ValueError):
@@ -37,7 +134,7 @@ class MCPToolResultError(RuntimeError):
             f"MCP tool {tool_name!r} failed with code={code!r}: {message}"
         )
 
-
+# Tool별 Output Schema 저장
 def register_mcp_output_schemas(tools: Iterable[Any]) -> None:
     """MCP Tool 이름별 outputSchema Validator를 등록한다."""
     _OUTPUT_VALIDATORS.clear()
@@ -47,7 +144,7 @@ def register_mcp_output_schemas(tools: Iterable[Any]) -> None:
             Draft202012Validator.check_schema(schema)
             _OUTPUT_VALIDATORS[tool.name] = Draft202012Validator(schema)
 
-
+# MCP 공통 결과 검증
 def validate_mcp_result(tool_name: str, result: Any) -> dict[str, Any]:
     """MCP Tool 결과의 상태, 코드, 데이터 및 출처 형식을 검증한다."""
     if not isinstance(result, dict):
@@ -66,7 +163,7 @@ def validate_mcp_result(tool_name: str, result: Any) -> dict[str, Any]:
         raise MCPResultValidationError(
             f"MCP tool {tool_name!r} returned an invalid success code: {code!r}"
         )
-
+# Tool별 Output Validation
     validator = _OUTPUT_VALIDATORS.get(tool_name)
     if validator is not None:
         try:
@@ -78,8 +175,7 @@ def validate_mcp_result(tool_name: str, result: Any) -> dict[str, Any]:
             ) from exc
 
     return result
-
-
+# MCP Tool 호출 하네스
 async def process_mcp_tool_call(ctx, call_tool, tool_name: str, args: dict[str, Any]):
     """MCP Tool을 한 번 호출하고 결과 검증 및 실행 Trace를 처리한다."""
     execution_trace_id = ctx.run_id or "unknown"
