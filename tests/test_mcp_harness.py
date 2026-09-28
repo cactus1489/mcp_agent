@@ -1,3 +1,4 @@
+import asyncio
 import json
 import logging
 import os
@@ -5,7 +6,7 @@ import sys
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import ANY, Mock, call, patch
+from unittest.mock import ANY, AsyncMock, Mock, call, patch
 
 
 sys.path.append(str(Path(__file__).resolve().parents[1] / ".venv" / "Lib" / "site-packages"))
@@ -13,9 +14,11 @@ sys.path.append(str(Path(__file__).resolve().parents[1] / ".venv" / "Lib" / "sit
 from agent.mcp_harness import (
     AGENT_USAGE_LIMITS,
     MCPServerConfig,
+    MCPServerRuntime,
     MCPResultValidationError,
     MCPToolResultError,
     create_mcp_server_runtimes,
+    discover_mcp_servers,
     load_mcp_server_configs,
     parse_mcp_server_configs,
     process_mcp_tool_call,
@@ -348,6 +351,92 @@ class MCPHarnessConfigurationTests(unittest.TestCase):
                 "search",
                 {"status": "success", "code": "200", "agri": True},
             )
+
+
+def make_runtime(
+    server_id: str,
+    url: str,
+    tools_or_error,
+) -> MCPServerRuntime:
+    toolset = Mock()
+    if isinstance(tools_or_error, BaseException):
+        toolset.list_tools = AsyncMock(side_effect=tools_or_error)
+    else:
+        toolset.list_tools = AsyncMock(return_value=tools_or_error)
+    return MCPServerRuntime(
+        config=MCPServerConfig(server_id, url, server_id),
+        toolset=toolset,
+        prefixed_toolset=Mock(),
+    )
+
+
+class MCPServerDiscoveryTests(unittest.IsolatedAsyncioTestCase):
+    async def test_discovery_returns_all_successful_servers_in_configuration_order(self):
+        agriculture_tools = [SimpleNamespace(name="crop", outputSchema=None)]
+        law_tools = [SimpleNamespace(name="statute", outputSchema=None)]
+        runtimes = [
+            make_runtime("agriculture", "https://agri.test/mcp", agriculture_tools),
+            make_runtime("law", "https://law.test/mcp", law_tools),
+        ]
+
+        with (
+            patch("agent.mcp_harness.register_mcp_output_schemas") as register,
+            patch("agent.mcp_harness.log_mcp_server_connected") as log_connected,
+        ):
+            result = await discover_mcp_servers(runtimes)
+
+        self.assertEqual(result, runtimes)
+        register.assert_has_calls(
+            [call("agriculture", agriculture_tools), call("law", law_tools)]
+        )
+        log_connected.assert_has_calls(
+            [
+                call("agriculture", "https://agri.test/mcp", 1),
+                call("law", "https://law.test/mcp", 1),
+            ]
+        )
+
+    async def test_discovery_logs_and_excludes_failed_servers(self):
+        failed = make_runtime(
+            "agriculture",
+            "https://agri.test/mcp?secret=value",
+            RuntimeError("private"),
+        )
+        healthy = make_runtime(
+            "law",
+            "https://law.test/mcp",
+            [SimpleNamespace(name="statute", outputSchema=None)],
+        )
+
+        with patch("agent.mcp_harness.log_mcp_server_connection_failed") as log_failed:
+            result = await discover_mcp_servers([failed, healthy])
+
+        self.assertEqual(result, [healthy])
+        log_failed.assert_called_once()
+        self.assertEqual(log_failed.call_args.args[:2], ("agriculture", failed.config.url))
+        self.assertIsInstance(log_failed.call_args.args[2], RuntimeError)
+
+    async def test_discovery_raises_when_all_servers_fail(self):
+        runtimes = [
+            make_runtime("agriculture", "https://agri.test/mcp", TimeoutError()),
+            make_runtime("law", "https://law.test/mcp", RuntimeError()),
+        ]
+
+        with (
+            self.assertLogs("uvicorn.error", level="ERROR"),
+            self.assertRaisesRegex(RuntimeError, "No MCP servers connected"),
+        ):
+            await discover_mcp_servers(runtimes)
+
+    async def test_discovery_propagates_cancellation(self):
+        runtime = make_runtime(
+            "agriculture",
+            "https://agri.test/mcp",
+            asyncio.CancelledError(),
+        )
+
+        with self.assertRaises(asyncio.CancelledError):
+            await discover_mcp_servers([runtime])
 
 
 class ProcessMCPToolCallTests(unittest.IsolatedAsyncioTestCase):

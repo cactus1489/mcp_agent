@@ -1,7 +1,8 @@
+import asyncio
 import json
 import os
 import time
-from collections.abc import Iterable
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from functools import partial
 from typing import Any
@@ -14,6 +15,8 @@ from pydantic_ai.mcp import MCPToolset
 from pydantic_ai.toolsets import AbstractToolset
 
 from .logging_utils import (
+    log_mcp_server_connected,
+    log_mcp_server_connection_failed,
     log_mcp_tool_complete,
     log_mcp_tool_error,
     log_mcp_tool_result,
@@ -119,6 +122,39 @@ def create_mcp_server_runtimes(
             )
         )
     return runtimes
+
+
+async def discover_mcp_servers(
+    runtimes: Sequence[MCPServerRuntime],
+) -> list[MCPServerRuntime]:
+    """Return healthy MCP runtimes after concurrent tool discovery."""
+    outcomes = await asyncio.gather(
+        *(runtime.toolset.list_tools() for runtime in runtimes),
+        return_exceptions=True,
+    )
+    healthy: list[MCPServerRuntime] = []
+
+    for runtime, outcome in zip(runtimes, outcomes, strict=True):
+        if isinstance(outcome, asyncio.CancelledError):
+            raise outcome
+        if isinstance(outcome, BaseException):
+            if not isinstance(outcome, Exception):
+                raise outcome
+            log_mcp_server_connection_failed(
+                runtime.config.id,
+                runtime.config.url,
+                outcome,
+            )
+            continue
+
+        tools = list(outcome)
+        register_mcp_output_schemas(runtime.config.id, tools)
+        log_mcp_server_connected(runtime.config.id, runtime.config.url, len(tools))
+        healthy.append(runtime)
+
+    if not healthy:
+        raise RuntimeError("No MCP servers connected.")
+    return healthy
 
 
 class MCPResultValidationError(ValueError):

@@ -126,7 +126,7 @@ def log_mcp_tool_result(
         item_count,
     )
 
-# Tool 완료 로그 
+# Tool 완료 로그
 def log_mcp_tool_complete(
     execution_trace_id: str,
     server_id: str,
@@ -212,7 +212,7 @@ def log_chat_failure(
     )
 
 
-# 질문·답변 감사 로그 
+# 질문·답변 감사 로그
 def write_qa_audit_log(execution_trace_id: str, question: str, answer: str) -> None:
     """Append only the user's question and final answer to today's log file."""
     log_dir = Path(__file__).resolve().parent.parent / "logs"
