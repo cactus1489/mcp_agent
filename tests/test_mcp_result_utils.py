@@ -9,6 +9,7 @@ sys.path.append(str(Path(__file__).resolve().parents[1] / ".venv" / "Lib" / "sit
 from pydantic_ai.messages import ToolReturnPart
 
 from agent.mcp_result_utils import get_mcp_results
+from agent.models import ToolResult
 
 
 class MCPResultUtilsTests(unittest.TestCase):
@@ -31,8 +32,11 @@ class MCPResultUtilsTests(unittest.TestCase):
             )
         ]
 
+        results = get_mcp_results(messages)
+
+        self.assertTrue(all(isinstance(result, ToolResult) for result in results))
         self.assertEqual(
-            get_mcp_results(messages),
+            [result.model_dump() for result in results],
             [
                 {
                     "tool_name": "search_weather_observations",

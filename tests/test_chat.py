@@ -10,7 +10,20 @@ from unittest.mock import AsyncMock, Mock, patch
 sys.path.append(str(Path(__file__).resolve().parents[1] / ".venv" / "Lib" / "site-packages"))
 
 from agent import app as app_module
+from agent.mcp_harness import MCPServerConfig
 from agent.models import ChatRequest
+
+
+class LifecycleAgent:
+    def __init__(self):
+        self.active = False
+
+    async def __aenter__(self):
+        self.active = True
+        return self
+
+    async def __aexit__(self, *args):
+        self.active = False
 
 
 class ChatTests(unittest.IsolatedAsyncioTestCase):
@@ -51,30 +64,39 @@ class ChatTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response.status, "FAILED")
 
     async def test_lifespan_builds_agent_from_only_healthy_prefixed_toolsets(self):
-        configs = [Mock(), Mock()]
-        runtimes = [Mock(), Mock()]
-        healthy = [runtimes[1]]
-        created_agent = Mock()
+        configs = [
+            MCPServerConfig(
+                id="agriculture",
+                url="https://agri.test/mcp",
+                prefix="agriculture",
+            )
+        ]
+        healthy = [Mock()]
+        created_agent = LifecycleAgent()
 
         with (
             patch.dict(os.environ, {"MCP_API_KEY": "Bearer shared"}, clear=False),
             patch.object(app_module, "load_mcp_server_configs", return_value=configs),
-            patch.object(app_module, "create_mcp_server_runtimes", return_value=runtimes) as create_runtimes,
-            patch.object(app_module, "discover_mcp_servers", AsyncMock(return_value=healthy)),
+            patch.object(
+                app_module,
+                "discover_mcp_servers",
+                AsyncMock(return_value=healthy),
+            ) as discover,
             patch.object(app_module, "create_agent", return_value=created_agent) as create_agent,
         ):
             async with app_module.lifespan(app_module.app):
                 self.assertIs(app_module.app.state.agent, created_agent)
+                self.assertTrue(created_agent.active)
 
-        create_runtimes.assert_called_once_with(configs, "Bearer shared")
-        create_agent.assert_called_once_with([runtimes[1].prefixed_toolset])
+        discover.assert_awaited_once_with(configs, "Bearer shared")
+        create_agent.assert_called_once_with([healthy[0].prefixed_toolset])
+        self.assertFalse(created_agent.active)
         self.assertFalse(hasattr(app_module.app.state, "agent"))
 
     async def test_lifespan_fails_when_discovery_has_no_healthy_server(self):
         with (
             patch.dict(os.environ, {"MCP_API_KEY": "Bearer shared"}, clear=False),
             patch.object(app_module, "load_mcp_server_configs", return_value=[Mock()]),
-            patch.object(app_module, "create_mcp_server_runtimes", return_value=[Mock()]),
             patch.object(
                 app_module,
                 "discover_mcp_servers",
@@ -104,7 +126,21 @@ class ChatTests(unittest.IsolatedAsyncioTestCase):
         self.assertIs(result, agent_class.return_value)
         self.assertEqual(agent_class.call_args.kwargs["toolsets"], toolsets)
 
-    async def test_chat_logs_final_agent_decision(self):
+    def test_create_agent_instructions_reject_tool_substitution_for_missing_inputs(self):
+        with patch.object(app_module, "Agent") as agent_class:
+            app_module.create_agent([])
+
+        instructions = agent_class.call_args.kwargs["instructions"]
+        self.assertIn(
+            "필수 인자가 부족하다는 이유로 관련성이 낮은 다른 도구를 대신 선택하지 않는다.",
+            instructions,
+        )
+        self.assertNotIn(
+            "일부 항목만 처리된 상태에서는 최종 출력 도구를 호출하지 않는다.",
+            instructions,
+        )
+
+    async def test_chat_logs_one_complete_event_with_final_decision(self):
         result = SimpleNamespace(
             output=SimpleNamespace(
                 status="NOT_APPLICABLE",
@@ -125,8 +161,9 @@ class ChatTests(unittest.IsolatedAsyncioTestCase):
             )
 
         logs = "\n".join(captured.output)
+        self.assertEqual(len(captured.records), 1)
         self.assertIn(
-            "AGENT DECISION status=NOT_APPLICABLE tool_count=0 missing_parameter_count=0",
+            "CHAT COMPLETE status=NOT_APPLICABLE tool_count=0 missing_parameter_count=0",
             logs,
         )
 
@@ -145,11 +182,10 @@ class ChatTests(unittest.IsolatedAsyncioTestCase):
 
         logs = "\n".join(captured.output)
         self.assertEqual(response.status, "FAILED")
-        self.assertIn("type=RuntimeError", logs)
-        self.assertIn(
-            "AGENT DECISION status=FAILED tool_count=0 missing_parameter_count=0",
-            logs,
-        )
+        self.assertEqual(len(captured.records), 1)
+        self.assertIn("CHAT COMPLETE status=FAILED", logs)
+        self.assertIn("error_type=RuntimeError", logs)
+        self.assertIn("error_location=app.py", logs)
         self.assertNotIn("private exception detail", logs)
 
 

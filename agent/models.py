@@ -6,6 +6,7 @@ class ChatRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
     request: str = Field(min_length=1)
 
+# 출력 상태 Schema 
 class AgentLLMOutput(BaseModel):
     status: Literal[
         "SUCCESS",
@@ -53,7 +54,7 @@ class AgentOutput(BaseModel):
         description="MCP input schema에서 누락된 정확한 property key 목록",
     )
     answer: str
-
+# 상태별 정합성 검증 
     @model_validator(mode="after")
     def validate_status(self) -> Self:
         if self.status == "SUCCESS":

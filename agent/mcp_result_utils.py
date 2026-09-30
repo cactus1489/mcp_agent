@@ -1,13 +1,14 @@
 from collections.abc import Iterable
-from typing import Any
 
-from pydantic_ai.messages import ToolReturnPart
+from pydantic_ai.messages import ModelMessage, ToolReturnPart
+
+from .models import ToolResult
 
 OUTPUT_TOOL_NAME = "return_agent_output"
 
 # MCP 실행 결과와 출처를 API 응답 형식으로 변환한다.
-def get_mcp_results(messages: Iterable) -> list[dict[str, Any]]:
-    results: list[dict[str, Any]] = []
+def get_mcp_results(messages: Iterable[ModelMessage]) -> list[ToolResult]:
+    results: list[ToolResult] = []
 
     for message in messages:
         for part in message.parts:
@@ -21,12 +22,12 @@ def get_mcp_results(messages: Iterable) -> list[dict[str, Any]]:
                     source = None
 
                 results.append(
-                    {
-                        "tool_name": part.tool_name,
-                        "tool_call_id": part.tool_call_id,
-                        "data": data,
-                        "source": source,
-                    }
+                    ToolResult(
+                        tool_name=part.tool_name,
+                        tool_call_id=part.tool_call_id,
+                        data=data,
+                        source=source,
+                    )
                 )
 
     return results

@@ -6,18 +6,16 @@ import sys
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import ANY, AsyncMock, Mock, call, patch
+from unittest.mock import AsyncMock, Mock, call, patch
 
+from pydantic import ValidationError
 
 sys.path.append(str(Path(__file__).resolve().parents[1] / ".venv" / "Lib" / "site-packages"))
 
 from agent.mcp_harness import (
-    AGENT_USAGE_LIMITS,
+    # AGENT_USAGE_LIMITS,
     MCPServerConfig,
-    MCPServerRuntime,
     MCPResultValidationError,
-    MCPToolResultError,
-    create_mcp_server_runtimes,
     discover_mcp_servers,
     load_mcp_server_configs,
     parse_mcp_server_configs,
@@ -78,10 +76,33 @@ class MCPHarnessConfigurationTests(unittest.TestCase):
         for server_id in ("test", "agriculture", "law"):
             register_mcp_output_schemas(server_id, [])
 
-    def test_agent_usage_limits_are_defined_in_harness(self):
-        self.assertEqual(AGENT_USAGE_LIMITS.request_limit, 15)
-        self.assertEqual(AGENT_USAGE_LIMITS.tool_calls_limit, 10)
-        self.assertEqual(AGENT_USAGE_LIMITS.total_tokens_limit, 500_000)
+    # Agent usage limits are intentionally disabled; the harness only owns MCP policies.
+    # def test_agent_usage_limits_are_defined_in_harness(self):
+    #     self.assertEqual(AGENT_USAGE_LIMITS.request_limit, 15)
+    #     self.assertEqual(AGENT_USAGE_LIMITS.tool_calls_limit, 10)
+    #     self.assertEqual(AGENT_USAGE_LIMITS.total_tokens_limit, 500_000)
+
+    def test_server_config_uses_pydantic_validation(self):
+        config = MCPServerConfig.model_validate(
+            {
+                "id": " agriculture ",
+                "url": "https://agri.test/mcp",
+                "prefix": " agriculture ",
+            }
+        )
+
+        self.assertEqual(config.id, "agriculture")
+        self.assertEqual(str(config.url), "https://agri.test/mcp")
+        self.assertEqual(config.prefix, "agriculture")
+        with self.assertRaises(ValidationError):
+            MCPServerConfig.model_validate(
+                {
+                    "id": "agriculture",
+                    "url": "ftp://agri.test/mcp",
+                    "prefix": "agriculture",
+                    "unexpected": True,
+                }
+            )
 
     def test_parses_multi_server_json(self):
         raw = (
@@ -138,62 +159,14 @@ class MCPHarnessConfigurationTests(unittest.TestCase):
         with patch.dict(os.environ, {"MCP_SERVERS": raw}, clear=False):
             self.assertEqual(
                 load_mcp_server_configs(),
-                [MCPServerConfig("one", "https://one.test/mcp", "one")],
+                [
+                    MCPServerConfig(
+                        id="one",
+                        url="https://one.test/mcp",
+                        prefix="one",
+                    )
+                ],
             )
-
-    def test_creates_prefixed_runtime_for_each_server_with_shared_authorization(self):
-        configs = [
-            MCPServerConfig("agriculture", "https://agri.test/mcp", "agriculture"),
-            MCPServerConfig("law", "https://law.test/mcp", "law"),
-        ]
-        agriculture_toolset = Mock()
-        law_toolset = Mock()
-
-        with patch(
-            "agent.mcp_harness.MCPToolset",
-            side_effect=[agriculture_toolset, law_toolset],
-        ) as toolset_class:
-            runtimes = create_mcp_server_runtimes(configs, "Bearer shared-key")
-
-        self.assertEqual([runtime.config for runtime in runtimes], configs)
-        self.assertIs(runtimes[0].toolset, agriculture_toolset)
-        self.assertIs(runtimes[0].prefixed_toolset, agriculture_toolset.prefixed.return_value)
-        self.assertIs(runtimes[1].toolset, law_toolset)
-        self.assertIs(runtimes[1].prefixed_toolset, law_toolset.prefixed.return_value)
-        agriculture_toolset.prefixed.assert_called_once_with("agriculture")
-        law_toolset.prefixed.assert_called_once_with("law")
-        toolset_class.assert_has_calls(
-            [
-                call(
-                    "https://agri.test/mcp",
-                    id="agriculture",
-                    headers={"Authorization": "Bearer shared-key"},
-                    max_retries=1,
-                    tool_error_behavior="retry",
-                    init_timeout=10,
-                    read_timeout=30,
-                    process_tool_call=ANY,
-                ),
-                call(
-                    "https://law.test/mcp",
-                    id="law",
-                    headers={"Authorization": "Bearer shared-key"},
-                    max_retries=1,
-                    tool_error_behavior="retry",
-                    init_timeout=10,
-                    read_timeout=30,
-                    process_tool_call=ANY,
-                ),
-            ]
-        )
-        for actual_call, server_id in zip(
-            toolset_class.call_args_list,
-            ("agriculture", "law"),
-            strict=True,
-        ):
-            callback = actual_call.kwargs["process_tool_call"]
-            self.assertIs(callback.func, process_mcp_tool_call)
-            self.assertEqual(callback.args, (server_id,))
 
     def test_rejects_tool_result_missing_schema_required_field(self):
         register_mcp_output_schemas(
@@ -353,39 +326,47 @@ class MCPHarnessConfigurationTests(unittest.TestCase):
             )
 
 
-def make_runtime(
+def make_server(
     server_id: str,
     url: str,
     tools_or_error,
-) -> MCPServerRuntime:
+) -> tuple[MCPServerConfig, Mock]:
     toolset = Mock()
     if isinstance(tools_or_error, BaseException):
         toolset.list_tools = AsyncMock(side_effect=tools_or_error)
     else:
         toolset.list_tools = AsyncMock(return_value=tools_or_error)
-    return MCPServerRuntime(
-        config=MCPServerConfig(server_id, url, server_id),
-        toolset=toolset,
-        prefixed_toolset=Mock(),
-    )
+    return MCPServerConfig(id=server_id, url=url, prefix=server_id), toolset
 
 
 class MCPServerDiscoveryTests(unittest.IsolatedAsyncioTestCase):
     async def test_discovery_returns_all_successful_servers_in_configuration_order(self):
         agriculture_tools = [SimpleNamespace(name="crop", outputSchema=None)]
         law_tools = [SimpleNamespace(name="statute", outputSchema=None)]
-        runtimes = [
-            make_runtime("agriculture", "https://agri.test/mcp", agriculture_tools),
-            make_runtime("law", "https://law.test/mcp", law_tools),
-        ]
+        agriculture, agriculture_toolset = make_server(
+            "agriculture", "https://agri.test/mcp", agriculture_tools
+        )
+        law, law_toolset = make_server("law", "https://law.test/mcp", law_tools)
 
         with (
+            patch(
+                "agent.mcp_harness.MCPToolset",
+                side_effect=[agriculture_toolset, law_toolset],
+            ),
             patch("agent.mcp_harness.register_mcp_output_schemas") as register,
             patch("agent.mcp_harness.log_mcp_server_connected") as log_connected,
         ):
-            result = await discover_mcp_servers(runtimes)
+            result = await discover_mcp_servers(
+                [agriculture, law], "Bearer shared-key"
+            )
 
-        self.assertEqual(result, runtimes)
+        self.assertEqual(
+            [runtime.prefixed_toolset for runtime in result],
+            [
+                agriculture_toolset.prefixed.return_value,
+                law_toolset.prefixed.return_value,
+            ],
+        )
         register.assert_has_calls(
             [call("agriculture", agriculture_tools), call("law", law_tools)]
         )
@@ -397,46 +378,66 @@ class MCPServerDiscoveryTests(unittest.IsolatedAsyncioTestCase):
         )
 
     async def test_discovery_logs_and_excludes_failed_servers(self):
-        failed = make_runtime(
+        failed, failed_toolset = make_server(
             "agriculture",
             "https://agri.test/mcp?secret=value",
             RuntimeError("private"),
         )
-        healthy = make_runtime(
+        healthy, healthy_toolset = make_server(
             "law",
             "https://law.test/mcp",
             [SimpleNamespace(name="statute", outputSchema=None)],
         )
 
-        with patch("agent.mcp_harness.log_mcp_server_connection_failed") as log_failed:
-            result = await discover_mcp_servers([failed, healthy])
+        with (
+            patch(
+                "agent.mcp_harness.MCPToolset",
+                side_effect=[failed_toolset, healthy_toolset],
+            ),
+            patch("agent.mcp_harness.log_mcp_server_connection_failed") as log_failed,
+        ):
+            result = await discover_mcp_servers(
+                [failed, healthy], "Bearer shared-key"
+            )
 
-        self.assertEqual(result, [healthy])
+        self.assertEqual([runtime.config for runtime in result], [healthy])
         log_failed.assert_called_once()
-        self.assertEqual(log_failed.call_args.args[:2], ("agriculture", failed.config.url))
+        self.assertEqual(
+            log_failed.call_args.args[:2],
+            ("agriculture", str(failed.url)),
+        )
         self.assertIsInstance(log_failed.call_args.args[2], RuntimeError)
 
     async def test_discovery_raises_when_all_servers_fail(self):
-        runtimes = [
-            make_runtime("agriculture", "https://agri.test/mcp", TimeoutError()),
-            make_runtime("law", "https://law.test/mcp", RuntimeError()),
-        ]
+        agriculture, agriculture_toolset = make_server(
+            "agriculture", "https://agri.test/mcp", TimeoutError()
+        )
+        law, law_toolset = make_server(
+            "law", "https://law.test/mcp", RuntimeError()
+        )
 
         with (
+            patch(
+                "agent.mcp_harness.MCPToolset",
+                side_effect=[agriculture_toolset, law_toolset],
+            ),
             self.assertLogs("uvicorn.error", level="ERROR"),
             self.assertRaisesRegex(RuntimeError, "No MCP servers connected"),
         ):
-            await discover_mcp_servers(runtimes)
+            await discover_mcp_servers([agriculture, law], "Bearer shared-key")
 
     async def test_discovery_propagates_cancellation(self):
-        runtime = make_runtime(
+        config, toolset = make_server(
             "agriculture",
             "https://agri.test/mcp",
             asyncio.CancelledError(),
         )
 
-        with self.assertRaises(asyncio.CancelledError):
-            await discover_mcp_servers([runtime])
+        with (
+            patch("agent.mcp_harness.MCPToolset", return_value=toolset),
+            self.assertRaises(asyncio.CancelledError),
+        ):
+            await discover_mcp_servers([config], "Bearer shared-key")
 
 
 class ProcessMCPToolCallTests(unittest.IsolatedAsyncioTestCase):
@@ -476,7 +477,7 @@ class ProcessMCPToolCallTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(result, result_with_string_source)
 
-    async def test_tool_result_error_propagates_without_custom_retry(self):
+    async def test_failed_status_raises_output_validation_error_without_retry(self):
         call_tool = SequenceToolCall(
             [
                 {
@@ -488,12 +489,12 @@ class ProcessMCPToolCallTests(unittest.IsolatedAsyncioTestCase):
             ]
         )
 
-        with self.assertRaises(MCPToolResultError):
+        with self.assertRaises(MCPResultValidationError):
             await process_mcp_tool_call("test", TEST_CONTEXT, call_tool, "sample", {})
 
         self.assertEqual(call_tool.call_count, 1)
 
-    async def test_does_not_retry_non_retryable_tool_error(self):
+    async def test_does_not_retry_failed_output_status(self):
         call_tool = SequenceToolCall(
             [
                 {
@@ -506,7 +507,7 @@ class ProcessMCPToolCallTests(unittest.IsolatedAsyncioTestCase):
             ]
         )
 
-        with self.assertRaises(MCPToolResultError):
+        with self.assertRaises(MCPResultValidationError):
             await process_mcp_tool_call("test", TEST_CONTEXT, call_tool, "sample", {})
 
         self.assertEqual(call_tool.call_count, 1)
@@ -550,18 +551,20 @@ class ProcessMCPToolCallTests(unittest.IsolatedAsyncioTestCase):
         }
 
         with self.assertLogs("uvicorn.error", level="INFO") as captured:
-            await process_mcp_tool_call("test", TEST_CONTEXT, call_tool, "sample", args)
+            returned = await process_mcp_tool_call(
+                "test", TEST_CONTEXT, call_tool, "sample", args
+            )
 
         logs = "\n".join(captured.output)
+        self.assertEqual(returned, SUCCESS_RESULT)
         self.assertIn("trace-123", logs)
         self.assertIn("call-456", logs)
         self.assertIn("tool=sample", logs)
         self.assertIn("MCP TOOL CALL START", logs)
-        self.assertIn("MCP TOOL RESULT", logs)
-        self.assertIn("MCP TOOL CALL COMPLETE", logs)
-        self.assertIn("status=success", logs)
-        self.assertIn("code=200", logs)
-        self.assertIn("data_type=dict", logs)
+        self.assertEqual(logs.count("MCP TOOL CALL COMPLETE"), 1)
+        self.assertNotIn("MCP TOOL RESULT", logs)
+        for removed_field in ("status=", "code=", "data_type=", "result_type=", "item_count="):
+            self.assertNotIn(removed_field, logs)
         self.assertNotIn("secret-api-key", logs)
         self.assertIn('"region": "수원"', logs)
         self.assertIn('"api_key": "***"', logs)
@@ -569,17 +572,17 @@ class ProcessMCPToolCallTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("010-1234-5678", logs)
         self.assertNotIn("secret-password", logs)
 
-    async def test_logs_tool_failure_without_exposing_exception_details(self):
+    async def test_tool_failure_attaches_context_without_duplicate_error_log(self):
         call_tool = SequenceToolCall([TimeoutError("private detail")])
 
-        with self.assertLogs("uvicorn.error", level="ERROR") as captured:
-            with self.assertRaises(TimeoutError):
+        with self.assertLogs("uvicorn.error", level="INFO") as captured:
+            with self.assertRaises(TimeoutError) as caught:
                 await process_mcp_tool_call("test", TEST_CONTEXT, call_tool, "sample", {})
 
         logs = "\n".join(captured.output)
-        self.assertIn("MCP TOOL CALL FAILED", logs)
-        self.assertIn("attempt=1", logs)
-        self.assertIn("error_type=TimeoutError", logs)
+        self.assertNotIn("MCP TOOL CALL FAILED", logs)
+        self.assertEqual(caught.exception.mcp_server_id, "test")
+        self.assertEqual(caught.exception.mcp_tool_name, "sample")
         self.assertNotIn("private detail", logs)
 
 

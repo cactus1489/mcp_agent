@@ -1,6 +1,7 @@
 import logging
 import json
 import threading
+import traceback
 from collections.abc import Mapping
 from datetime import datetime
 from pathlib import Path
@@ -33,7 +34,6 @@ def _format_mcp_host(url: str) -> str:
         hostname = f"[{hostname}]"
     return f"{hostname}:{parsed.port}" if parsed.port is not None else hostname
 
-
 def log_mcp_server_connected(server_id: str, url: str, tool_count: int) -> None:
     logger.info(
         "MCP SERVER CONNECTED id=%s host=%s tool_count=%d",
@@ -41,7 +41,6 @@ def log_mcp_server_connected(server_id: str, url: str, tool_count: int) -> None:
         _format_mcp_host(url),
         tool_count,
     )
-
 
 def log_mcp_server_connection_failed(
     server_id: str,
@@ -98,35 +97,7 @@ def log_mcp_tool_start(
         masked_args,
     )
 
-# Tool 결과 요약 로그
-def log_mcp_tool_result(
-    execution_trace_id: str,
-    server_id: str,
-    tool_name: str,
-    tool_call_id: str,
-    result: Mapping[str, Any],
-) -> None:
-    """Log validated MCP result metadata without recording raw result values."""
-    data = result.get("data")
-    result_type = data.get("result_type") if isinstance(data, Mapping) else None
-    items = data.get("items") if isinstance(data, Mapping) else None
-    item_count = len(items) if isinstance(items, list) else None
-
-    logger.info(
-        "[%s] MCP TOOL RESULT server=%s tool=%s call_id=%s status=%s code=%s "
-        "data_type=%s result_type=%s item_count=%s",
-        execution_trace_id,
-        server_id,
-        tool_name,
-        tool_call_id,
-        result.get("status"),
-        result.get("code"),
-        type(data).__name__,
-        result_type,
-        item_count,
-    )
-
-# Tool 완료 로그
+# Tool 완료 및 결과 요약 로그
 def log_mcp_tool_complete(
     execution_trace_id: str,
     server_id: str,
@@ -145,70 +116,52 @@ def log_mcp_tool_complete(
         duration,
     )
 
-# Tool 오류 로그
-def log_mcp_tool_error(
-    execution_trace_id: str,
-    server_id: str,
-    tool_name: str,
-    tool_call_id: str,
-    attempt: int,
-    duration: float,
-    exc: Exception,
-    retrying: bool,
-) -> None:
-    event = "RETRY" if retrying else "FAILED"
-    log = logger.warning if retrying else logger.error
-    log(
-        "[%s] MCP TOOL CALL %s server=%s tool=%s call_id=%s attempt=%d duration=%.3fs error_type=%s code=%s",
-        execution_trace_id,
-        event,
-        server_id,
-        tool_name,
-        tool_call_id,
-        attempt,
-        duration,
-        type(exc).__name__,
-        getattr(exc, "code", None),
-    )
-# 최종 Agent 판단 로그
-def log_agent_decision(
+def _format_error_location(exc: Exception) -> str:
+    frames = traceback.extract_tb(exc.__traceback__)
+    agent_dir = Path(__file__).resolve().parent
+    for frame in reversed(frames):
+        frame_path = Path(frame.filename).resolve()
+        if frame_path == agent_dir or agent_dir in frame_path.parents:
+            return f"{frame_path.name}:{frame.lineno}:{frame.name}"
+    if frames:
+        frame = frames[-1]
+        return f"{Path(frame.filename).name}:{frame.lineno}:{frame.name}"
+    return "unknown"
+
+
+def log_chat_complete(
     execution_trace_id: str,
     status: str,
     tool_count: int,
     missing_parameter_count: int,
+    elapsed: float,
+    error: Exception | None = None,
 ) -> None:
-    """Log the final observable Agent decision without prompt or answer text."""
-    logger.info(
-        "[%s] AGENT DECISION status=%s tool_count=%d missing_parameter_count=%d",
+    log = logger.error if status == "FAILED" else logger.info
+    if error is None:
+        log(
+            "[%s] CHAT COMPLETE status=%s tool_count=%d missing_parameter_count=%d elapsed=%.3fs",
+            execution_trace_id,
+            status,
+            tool_count,
+            missing_parameter_count,
+            elapsed,
+        )
+        return
+
+    log(
+        "[%s] CHAT COMPLETE status=%s tool_count=%d missing_parameter_count=%d "
+        "error_type=%s error_location=%s server=%s tool=%s code=%s elapsed=%.3fs",
         execution_trace_id,
         status,
         tool_count,
         missing_parameter_count,
-    )
-
-
-def log_chat_timeout(execution_trace_id: str, elapsed: float) -> None:
-    logger.warning("[%s] TIMEOUT elapsed=%.3fs", execution_trace_id, elapsed)
-
-
-def log_chat_complete(execution_trace_id: str, elapsed: float) -> None:
-    logger.info(
-        "[%s] CHAT COMPLETE elapsed=%.3fs",
-        execution_trace_id,
+        type(error).__name__,
+        _format_error_location(error),
+        getattr(error, "mcp_server_id", None),
+        getattr(error, "mcp_tool_name", None),
+        getattr(error, "code", None),
         elapsed,
-    )
-
-
-def log_chat_failure(
-    execution_trace_id: str,
-    elapsed: float,
-    exc: Exception,
-) -> None:
-    logger.error(
-        "[%s] FAILED elapsed=%.3fs type=%s",
-        execution_trace_id,
-        elapsed,
-        type(exc).__name__,
     )
 
 
