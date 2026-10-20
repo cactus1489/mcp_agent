@@ -1,0 +1,60 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#ffffff">
+  <title>AI 이삭이 · 농업 상담</title>
+  <link rel="icon" type="image/png" href="/ui/assets/images/ai-profile.png">
+  <link rel="stylesheet" href="/ui/assets/app.css">
+  <script type="module" src="/ui/assets/app.mjs"></script>
+</head>
+<body>
+  <div class="app-shell">
+    <header class="app-header">
+      <a class="brand" href="/ui" aria-label="AI 이삭이 홈"><span class="brand-leaf" aria-hidden="true">✦</span> AI 이삭이</a>
+      <div class="header-actions">
+        <button class="icon-button" id="new-chat" aria-label="새 대화" title="새 대화"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14M5 12h14"/></svg></button>
+        <button class="icon-button" id="settings-button" aria-label="대화 설정" title="대화 설정"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h16M4 17h16"/><circle cx="9" cy="7" r="2"/><circle cx="15" cy="17" r="2"/></svg></button>
+      </div>
+    </header>
+
+    <main id="main-content">
+      <section class="welcome" id="welcome">
+        <div class="hero">
+          <div class="hero-glow" aria-hidden="true"></div>
+          <img class="hero-character" src="/ui/assets/images/hero-isac.png" alt="이삭이 캐릭터" width="190" height="193">
+          <h1>안녕하세요, 이삭이가<br>풍년농사를 도와드릴게요!</h1>
+          <p class="hero-caption">궁금한 농업 정보를 편하게 물어보세요.</p>
+        </div>
+        <section class="recent-section" aria-labelledby="recent-heading">
+          <div class="section-heading"><h2 id="recent-heading">최근 질문</h2><span id="recent-count"></span></div>
+          <div id="recent-questions"></div>
+          <div class="empty-history" id="empty-history"><span class="chat-symbol" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M20 11a8 8 0 0 1-8 8H5l-3 3V11a9 9 0 0 1 18 0Z"/><path d="M7 10h8M7 14h5"/></svg></span><p>아직 최근 질문이 없어요</p></div>
+        </section>
+      </section>
+      <section class="conversation" id="conversation" aria-label="이삭이와의 대화" hidden></section>
+    </main>
+
+    <footer class="composer-area">
+      <div class="composer-label"><span class="connection-dot" id="connection-dot"></span><span id="connection-label">AI 이삭이에게 질문하세요</span><button id="cancel-request" class="text-button" hidden>응답 대기 중단</button></div>
+      <form id="chat-form" class="composer">
+        <label class="sr-only" for="question">질문</label>
+        <textarea id="question" rows="1" maxlength="4000" placeholder="궁금한 내용을 입력하세요" required></textarea>
+        <button id="send-button" class="send-button" type="submit" aria-label="질문 보내기"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m5 12 7-7 7 7M12 5v14"/></svg></button>
+      </form>
+      <p class="composer-note">Enter로 전송 · Shift + Enter로 줄바꿈</p>
+    </footer>
+  </div>
+
+  <dialog id="settings-dialog" aria-labelledby="settings-title">
+    <form id="settings-form">
+      <div class="dialog-heading"><h2 id="settings-title">대화 설정</h2><button type="button" class="icon-button" id="close-settings" aria-label="설정 닫기">×</button></div>
+      <p>서버의 인증 설정으로 자동 연결됩니다.<br>질문과 답변은 기존 <code>/chat</code>에서 처리합니다.</p>
+      <label class="checkbox-label"><input id="include-history" type="checkbox" checked> 후속 질문에 이전 대화 함께 전달</label>
+      <button class="primary-button" type="submit">설정 적용</button>
+    </form>
+  </dialog>
+  <div id="toast" class="toast" role="status" hidden></div>
+</body>
+</html>

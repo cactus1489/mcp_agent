@@ -1,0 +1,31 @@
+{
+  "source": "D:\\dev\\workspace\\isaki-mcp-dev\\src\\mcp_server\\domain\\food\\standard\\model.py",
+  "synthetic_inputs_only": true,
+  "checks": [
+    {
+      "format": "JSON list",
+      "expected_steps": 2,
+      "actual_steps": 2
+    },
+    {
+      "format": "XML wrapper",
+      "expected_steps": 2,
+      "actual_steps": 2
+    },
+    {
+      "format": "single step wrapper",
+      "expected_steps": 1,
+      "actual_steps": 1
+    },
+    {
+      "format": "empty list",
+      "expected_steps": 0,
+      "actual_steps": 0
+    },
+    {
+      "format": "null list",
+      "expected_steps": 0,
+      "actual_steps": 0
+    }
+  ]
+}
